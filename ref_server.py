@@ -33,7 +33,7 @@ if __name__ == '__main__':
     import bottle, threading, queue
     os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-    model_path = "/data2/Qwen/Qwen2.5-7B"
+    model_path = "Qwen/Qwen2.5-7B"
 
     ref_model = AutoModelForCausalLM.from_pretrained(model_path,
             torch_dtype=torch.bfloat16, _attn_implementation="sdpa").to('cuda')
@@ -51,7 +51,7 @@ if __name__ == '__main__':
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
 
-    raw_queue = queue.LifoQueue()
+    raw_queue = queue.LifoQueue() # 后进先出（LIFO）队列
     result_queue = queue.LifoQueue()
 
     app = bottle.Bottle()

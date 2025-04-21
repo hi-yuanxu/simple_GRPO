@@ -8,15 +8,15 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "/data2/Qwen/Qwen2.5-7B"
-gen_device = 4    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
+model_path = "Qwen/Qwen2.5-7B"
+gen_device = 1   # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
 beta = 0.04
-all_steps = 1000
+all_steps = 200
 Q_batch_size = 5
 num_pre_Q = 8
 train_batch_size = 8
 gen_update_steps = 16
-save_steps = 200
+save_steps = 20
 compute_gen_logps = True
 clip_param = 0.2
 ref_server = "http://localhost:59875"
@@ -49,10 +49,10 @@ def get_batch():
         if r == b'empty': return None
     except: return None
     dd = bytes_list_to_list(r)
-    data = json.loads(dd[0]) 
-    data['inputs'] = bytes_to_tensor(dd[1])
-    data['rewards'] = bytes_to_tensor(dd[2])
-    data['refs'] = bytes_to_tensor(dd[3])
+    data = json.loads(dd[0]) # prompt length
+    data['inputs'] = bytes_to_tensor(dd[1]) # prompt+answer
+    data['rewards'] = bytes_to_tensor(dd[2]) # 8（batch）
+    data['refs'] = bytes_to_tensor(dd[3]) # answer
     if len(dd) == 5: data['gen_logps'] = bytes_to_tensor(dd[4])
     return data
 
@@ -98,8 +98,8 @@ def gen_worker(Q, physics_device):
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.5)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
 
-    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
-    gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
+    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700) # 生成8个候选
+    gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1) # 计算概率log用
 
     from datasets import load_dataset
     dataset = load_dataset("openai/gsm8k", "main", split="train")
@@ -122,6 +122,7 @@ def gen_worker(Q, physics_device):
         return answers, ans_token_ids
 
     from math_verify import parse, verify, ExprExtractionConfig
+    # 这两个reward都是rule-based
     def reward_correct(item, answer):
         pattern = r'\d+\.\d+|\d+/\d+|\d+'
         nums = re.findall(pattern, answer) 
@@ -139,7 +140,7 @@ def gen_worker(Q, physics_device):
 
     def gen_samples(inputs):
         prompts = [x["Q"] for x in inputs]
-        answers, ans_token_ids = gen_answers(prompts)
+        answers, ans_token_ids = gen_answers(prompts) # 5x8个候选
         rewards = []
         for i, inp in enumerate(inputs):
             for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
@@ -147,7 +148,7 @@ def gen_worker(Q, physics_device):
         prompts_text = [tokenizer.apply_chat_template([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
-        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
+        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids # 5, 40, 40, 40
 
     def try_update_model():
         try:
@@ -164,23 +165,23 @@ def gen_worker(Q, physics_device):
     from torch.nn.utils.rnn import pad_sequence
     for it in range(999999999):
         if it % 3 == 0: try_update_model()
-        inputs = random.sample(QAs, Q_batch_size)
+        inputs = random.sample(QAs, Q_batch_size) # batch 5
         tic = time.time()
         prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
-        print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
-        if it % 5 == 0: print('answers:', answers[0])
+        # print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, ) # 5x8个reward
+        if it % 5 == 0: print('answers:', answers[0]) # 1个answer
 
-        for i, pp in enumerate(prompt_inputs):
+        for i, pp in enumerate(prompt_inputs): # 5个prompt
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
             plen = prompt_ids.shape[1]
             curr_answers = answers[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_ans_ids = ans_token_ids[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_rewards = rewards[i*num_pre_Q:(i+1)*num_pre_Q]
-            if curr_rewards.max() - curr_rewards.min() < 1e-4: continue
+            if curr_rewards.max() - curr_rewards.min() < 1e-4: continue # 没有显著的chosen和reject区别
 
             if ref_server_ver == 'tensor':
                 curr_rewards = (curr_rewards - curr_rewards.mean()) / (curr_rewards.std() + 1e-4)
-                for ii in range(0, num_pre_Q, train_batch_size):
+                for ii in range(0, num_pre_Q, train_batch_size): #[0]
                     sub_rewards = curr_rewards[ii:ii+train_batch_size]
                     sub_ans_ids = curr_ans_ids[ii:ii+train_batch_size]
                     tensor_list = [torch.tensor(lst) for lst in sub_ans_ids]
@@ -189,10 +190,10 @@ def gen_worker(Q, physics_device):
                     merged_ids = torch.cat([Qrep, output_ids], dim=1)
                     data = [json.dumps({"plen": plen}).encode(), tensor_to_bytes(merged_ids), tensor_to_bytes(sub_rewards)]       
 
-                    if compute_gen_logps:
+                    if compute_gen_logps: # 在gen_worker中计算log
                         zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
                         zz = [xx.prompt_logprobs[plen:] for xx in zz]
-                        gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz])
+                        gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz]) # 8 x answer_len
                         data.append(tensor_to_bytes(gen_logps))
 
                     xdata = make_bytes_list(data)
@@ -223,7 +224,7 @@ if __name__ == '__main__':
     engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, 
                                                 model_parameters=model.parameters())
 
-    progress = range(1, all_steps+1)
+    progress = range(1, all_steps+1) # 1000
     if dist.get_rank() == 0: progress = tqdm(progress)
     for step in progress:
         batch = get_batch()
@@ -238,7 +239,7 @@ if __name__ == '__main__':
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss.item():.6f}")
 
-        if step % gen_update_steps == 0:
+        if step % gen_update_steps == 0: # 16
             dist.barrier()
             if dist.get_rank() == 0:
                 print('[TRAINING PROC] sending latest state_dict ...')
@@ -247,7 +248,7 @@ if __name__ == '__main__':
                 print('[TRAINING PROC] send state_dict ok!')
             dist.barrier()
 
-        if step % save_steps == 0:
+        if step % save_steps == 0: # 20
             dist.barrier()
             if dist.get_rank() == 0:
                 print('saving model')
